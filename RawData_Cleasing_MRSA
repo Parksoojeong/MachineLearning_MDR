@@ -1,0 +1,215 @@
+###RawData_Cleasing_MRSA.py
+
+## data handling
+import numpy as np
+import pandas as pd
+from pandas import Series, DataFrame
+import os
+from os import listdir
+from os.path import isfile, join
+import datetime
+
+
+class preprocessing:
+    def __init__(self, pwd, files, mdr_list):
+        self.pwd = pwd
+        self.files = files
+        self.mdr_list = mdr_list
+
+    # st data cleansing
+    def st_cleansing(self):
+        # read data
+        st10 = []
+        for i in range(4):
+            st10.append(pd.read_csv(self.pwd + self.files[i], encoding='euc_kr', keep_default_na=False, na_values=""))
+        st10 = pd.concat([df for df in st10], axis=0)
+
+        # delete outliers
+        st10 = st10[st10.MED_YMD > "2007-12-31"]
+
+        # delete duplicates
+        st10 = st10.drop_duplicates()
+
+        # make primary key using 'ID' and 'DATE'
+        st_key = [str(col1) + "_" + col2 for col1, col2 in zip(st10.PTNT_UUID, st10.MED_YMD)]
+        st10 = pd.concat([st10, Series(st_key, name="KEY", index=st10.index)], axis=1)
+
+        # change 'DATE' name
+        st10.rename(index=str, columns={"MED_YMD": "MED_DATE"}, inplace=True)
+        return st10
+
+    # ai data cleansing
+    def ai_cleansing(self, st10):
+        # read data
+        ainputall10 = pd.read_csv(self.pwd + self.files[5], encoding='euc_kr', keep_default_na=False, na_values="")
+        ainputall10 = ainputall10.drop_duplicates()
+
+        # delete 00:00:00
+        ainputall10.MED_DATE = ainputall10.MED_DATE.apply(lambda x: x[:10])
+        #         MED_DATE
+        #         aaaaaaaaa <-
+        #         b
+        #         c
+        #         d
+        #         e
+
+        # delete .0
+        ainputall10.PTNT_UUID = ainputall10.PTNT_UUID.apply(lambda x: str(x)[:-2])
+
+        # delete records who isn't younger than 65 years but could be pregnant
+        temp = [not row for row in (ainputall10.AGE_YR >= 55) & (ainputall10.PREG_YN == "Y")]
+        ainputall10 = ainputall10.loc[temp, :]
+
+        # delete records who isn't older than 3 years but could be pregnant
+        temp = [not row for row in (ainputall10.AGE_YR <= 13) & (ainputall10.PREG_YN == "Y")]
+        ainputall10 = ainputall10.loc[temp, :]
+
+        # make primary key using 'ID' and 'DATE'
+        ai_key = [col1 + "_" + col2 for col1, col2 in zip(ainputall10.PTNT_UUID, ainputall10.MED_DATE)]
+        ainputall10 = pd.concat([ainputall10, Series(ai_key, name="KEY", index=ainputall10.index)], axis=1)
+
+        # select records using st data
+        temp = ainputall10.KEY.isin(st10.KEY)
+        aist10 = ainputall10.loc[temp, :]
+        return aist10
+
+    # ai-mdr-match data cleansing
+    def multi_label_MDR(self, aist10):
+        # read data
+        aimdrcheck = pd.read_csv(self.pwd + self.files[4], encoding='euc_kr', keep_default_na=False, na_values="")
+
+        # make MDR_TYPE variable dummy and delete 'VRSA'
+        temp = pd.get_dummies(aimdrcheck.MDR_TYPE)
+        temp.drop(["VRSA"], axis=1, inplace=True)
+        aimdrcheck = pd.concat([aimdrcheck.iloc[:, :2], temp], axis=1)  # ?
+
+        # aggregate mdr state by key
+        aimdrcheck = aimdrcheck.groupby(["PTNT_UUID", "MED_DATE"]).agg({key: sum for key in self.mdr_list})
+        aimdrcheck.reset_index(level=["PTNT_UUID", "MED_DATE"], inplace=True)
+
+        # make primary key using 'ID' and 'DATE'
+        aimdr_key = [str(col1) + "_" + col2 for col1, col2 in zip(aimdrcheck.PTNT_UUID, aimdrcheck.MED_DATE)]
+        aimdrcheck = pd.concat([aimdrcheck, Series(aimdr_key, name="KEY", index=aimdrcheck.index)], axis=1)
+
+        # add patients' mdr-state to aist10 data
+        temp1 = aist10.query("MDR_TYPE == '0'").drop(["MDR_TYPE"], axis=1)
+        temp = {key: np.zeros(temp1.shape[0], dtype='uint8') for key in self.mdr_list}
+        temp = pd.DataFrame(temp, index=temp1.index)
+        temp1 = pd.concat([temp1, temp], axis=1)
+
+        temp2 = aist10.query("MDR_TYPE != '0'").drop(["MDR_TYPE"], axis=1)
+        temp2 = pd.merge(temp2, aimdrcheck.iloc[:, 2:], on='KEY')
+
+        aist10mdrchecked = pd.concat([temp1, temp2], axis=0)
+        return aist10mdrchecked
+
+    # calculate the duration of hopital stay
+    def differ(self, vec):
+        l = len(vec)
+        null = np.zeros(l)
+        if l > 1:
+            for i in range(1, l):
+                temp = vec[i] - vec[i - 1]
+                null[i] = temp.days
+            return null
+        else:
+            return null
+
+    # make inputdata using RFPool
+    def make_inputdata(self, aist10mdrchecked, mdr):
+        # delete unnecessary feature
+        try:
+            aist10mdrchecked.drop(["THORA_YN"], axis=1, inplace=True)
+        except:
+            print("'THORA_YN' isn't in the aist10mdrchecked")
+
+        # delete outliers
+        inputdata = aist10mdrchecked.loc[aist10mdrchecked.AGE_MON > 0, :]
+
+        # select records which don't have 'CURR_LOS' but have 'ADM_PATH'
+        temp = inputdata.ADM_PATH.notna() & inputdata.CURR_LOS.isna()
+        inputdata = inputdata.loc[[not item for item in temp], :]
+
+        # select patients who stay in a hospital for a certain period of time
+        inputdata = inputdata.loc[inputdata.ADM_PATH.notna(), :]
+
+        # rename features on 'MDR_TYPE'
+        inputdata.rename(index=str, columns={item: "MDR_TYPE_" + item for item in self.mdr_list}, inplace=True)
+
+        # risk factor pool for each MDR_TYPE
+        RFPool = pd.read_csv(self.pwd + self.files[6], encoding='euc_kr', keep_default_na=False, na_values="")
+
+        ch = ["PTNT_UUID", "KEY"]
+        # select features using RFPool data
+        if mdr is "MRSA":
+            ch.extend(RFPool.loc[RFPool.MRSA.isna(), 'var'])
+        elif mdr is "VRE":
+            ch.extend(RFPool.loc[RFPool.VRE.isna(), 'var'])
+        else:
+            print("Enter correct word.")
+            return None
+        inputdata = inputdata.loc[:, ch]
+
+        # manage 'DATE' type
+        inputdata.MED_DATE = pd.to_datetime(inputdata.MED_DATE, format='%Y/%m/%d')
+
+        # get the duration of hopital stay by 'ID' using differ
+        temp = np.argsort(inputdata.MED_DATE)
+        inputdata = inputdata.iloc[temp, :]
+        inputdata['MDdiff'] = inputdata.groupby('PTNT_UUID')['MED_DATE'].transform(self.differ)
+        inputdata.MDdiff = inputdata.MDdiff.astype("int64")
+
+        # leave the records whose 'MDdiff' is over 30 days
+        temp1 = inputdata.loc[inputdata.MDdiff > 30, :]
+
+        # select the first visit of each patient who stay in hospital less than 30 days
+        temp2 = inputdata.loc[inputdata.MDdiff <= 30, :]
+
+        temp3 = temp2.groupby('PTNT_UUID').apply(lambda x: min(x.MED_DATE))
+        temp3.rename("MED_DATE", inplace=True)
+
+        temp = [str(col1) + "_" + str(col2.date()) for col1, col2 in zip(temp3.index, temp3)]
+        temp3 = pd.concat([temp3, Series(temp, name="KEY", index=temp3.index)], axis=1)
+
+        temp = temp2.loc[temp2.KEY.isin(temp3.KEY), :]
+
+        # merge two tables and delete unnecessary features for machine learning model
+        inputdata = pd.concat([temp1, temp], axis=0)
+        inputdata.drop(["KEY", "PTNT_UUID", "MED_DATE", "MDdiff"], axis=1, inplace=True)
+        return inputdata
+
+
+if __name__ == "__main__":
+    # present working directory for raw data
+    pwd_data = "./rawData/"
+
+    # present working directory for cleaned data
+    pwd_mdr = "./MDR_data/"
+
+    # create new folder
+    if not os.path.exists(pwd_mdr):
+        os.makedirs(pwd_mdr)
+
+    # list of files on present working directory for raw data
+    cwd = os.getcwd()
+    files = [f for f in listdir(cwd + pwd_data) if isfile(join(cwd + pwd_data, f))]
+
+    # mdr-list which you want to deal with
+    mdr_list = ["MRSA", "MRAB", "MRPA", "VRE", "CRE"]
+
+    # which of them do you want to make?
+    target = ["MRSA", "VRE"]
+
+    # what day is it today?
+    date = "20181018"
+
+    # generate objects using 'preprocessing' class
+    data = preprocessing(pwd_data, files, mdr_list)
+    st10 = data.st_cleansing()
+    aist10 = data.ai_cleansing(st10)
+    aist10mdrchecked = data.multi_label_MDR(aist10)
+
+    # write cleaned data to csv file
+    for mdr in target:
+        inputdata = data.make_inputdata(aist10mdrchecked, mdr)
+        inputdata.to_csv(cwd + pwd_mdr + date + "_" + mdr + ".csv", index=False)
